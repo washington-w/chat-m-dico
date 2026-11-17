@@ -23,8 +23,8 @@ if (file_exists(__DIR__ . '/../conexao.php')) {
 if (!$dbStatus) {
     try {
         $pdo = new PDO(
-            "mysql:host=localhost;dbname=uilian77_aluno7;charset=utf8mb4",
-            "uilian77_a7",
+            "LINK",
+            "USUARIO",
             "SUA_SENHA_MYSQL_AQUI",
             [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
