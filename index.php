@@ -5,6 +5,7 @@ if (session_status() === PHP_SESSION_NONE) {
 
 define('DEEPSEEK_API_KEY', 'SUA_CHAVE_API_DEEPSEEK_AQUI');
 define('DEEPSEEK_API_URL', 'https://api.deepseek.com/chat/completions');
+define('ADMIN_PIN', 'SEU_PIN_ADMIN_AQUI');
 
 $pdo = null;
 $dbStatus = false;
@@ -23,8 +24,8 @@ if (file_exists(__DIR__ . '/../conexao.php')) {
 if (!$dbStatus) {
     try {
         $pdo = new PDO(
-            "LINK",
-            "USUARIO",
+            "mysql:host=SEU_HOST_MYSQL;dbname=SEU_BANCO_MYSQL;charset=utf8mb4",
+            "SEU_USUARIO_MYSQL",
             "SUA_SENHA_MYSQL_AQUI",
             [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
@@ -93,19 +94,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action'])) {
     if ($_GET['action'] === 'cancel_appointment') {
         $input = json_decode(file_get_contents('php://input'), true);
         $idConsulta = intval($input['id'] ?? 0);
+        $pinInformado = trim((string) ($input['pin'] ?? ''));
+
+        if (!hash_equals(ADMIN_PIN, $pinInformado)) {
+            echo json_encode(['success' => false, 'error' => 'PIN administrativo incorreto.']);
+            exit;
+        }
+
         if ($dbStatus && $idConsulta > 0) {
             $stmtDel = $pdo->prepare("DELETE FROM consultas_medicas WHERE id = ?");
             $stmtDel->execute([$idConsulta]);
             echo json_encode(['success' => true]);
         } else {
-            echo json_encode(['success' => false]);
+            echo json_encode(['success' => false, 'error' => 'Não foi possível cancelar a consulta.']);
         }
         exit;
     }
 
     if ($_GET['action'] === 'send') {
         $input = json_decode(file_get_contents('php://input'), true);
-        $userMsg = trim($input['message'] ?? '');
+        $userMsg = trim((string) ($input['message'] ?? ''));
 
         if (empty($userMsg)) {
             echo json_encode(['success' => false, 'error' => 'Mensagem vazia.']);
@@ -155,11 +163,11 @@ Para concluir o agendamento de uma consulta, você precisa coletar do paciente:
 1. Qual médico ou especialidade deseja (Cardiologia, Dermatologia ou Pediatria).
 2. Nome completo do paciente.
 3. Telefone/WhatsApp de contato.
-4. Data desejada (no formato YYYY-MM-DD, verificando se não cai em horário ocupado e se está dentro do dia da semana do médico).
+4. Data desejada (no formato YYYY-MM-DD, verificando se não cai em horário ocupado, se não é uma data passada e se está dentro do dia da semana do médico).
 5. Horário desejado (HH:MM, ex: 09:00, 14:30).
 
 IMPORTANTE: Assim que o paciente fornecer TODOS esses dados e você confirmar que o horário está livre, emita EXATAMENTE no final da sua resposta a seguinte tag JSON (para que nosso sistema PHP grave a consulta no banco de dados MySQL):
-[AGENDAR_CONSULTA]{"medico_id": 1, "paciente_nome": "Nome Aqui", "paciente_telefone": "44999999999", "data_consulta": "2026-11-15", "hora_consulta": "14:00", "observacoes": "Motivo resumido"}[/AGENDAR_CONSULTA]
+[AGENDAR_CONSULTA]{"medico_id": 1, "paciente_nome": "Nome Aqui", "paciente_telefone": "44999999999", "data_consulta": "2026-11-18", "hora_consulta": "14:00", "observacoes": "Motivo resumido"}[/AGENDAR_CONSULTA]
 
 Emita a tag [AGENDAR_CONSULTA] APENAS quando tiver todos os 5 dados confirmados. Seja educada, objetiva e empática.
 PROMPT;
@@ -189,8 +197,8 @@ PROMPT;
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($postData));
         curl_setopt($ch, CURLOPT_TIMEOUT, 45);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
             'Content-Type: application/json',
             'Authorization: Bearer ' . DEEPSEEK_API_KEY
@@ -215,26 +223,39 @@ PROMPT;
 
             if ($dbStatus && is_array($jsonAgendamento) && !empty($jsonAgendamento['medico_id']) && !empty($jsonAgendamento['paciente_nome'])) {
                 $medId   = intval($jsonAgendamento['medico_id']);
-                $pacNome = trim($jsonAgendamento['paciente_nome']);
-                $pacTel  = trim($jsonAgendamento['paciente_telefone'] ?? 'Não informado');
-                $dtCons  = trim($jsonAgendamento['data_consulta']);
-                $hrCons  = trim($jsonAgendamento['hora_consulta']);
+                $pacNome = mb_substr(trim((string) $jsonAgendamento['paciente_nome']), 0, 120);
+                $pacTel  = mb_substr(trim((string) ($jsonAgendamento['paciente_telefone'] ?? 'Não informado')), 0, 40);
+                $dtCons  = trim((string) ($jsonAgendamento['data_consulta'] ?? ''));
+                $hrCons  = trim((string) ($jsonAgendamento['hora_consulta'] ?? ''));
                 if (strlen($hrCons) === 5) $hrCons .= ':00';
-                $obs     = trim($jsonAgendamento['observacoes'] ?? '');
+                $obs     = trim((string) ($jsonAgendamento['observacoes'] ?? ''));
 
-                $stmtCheck = $pdo->prepare("SELECT COUNT(*) FROM consultas_medicas WHERE medico_id = ? AND data_consulta = ? AND hora_consulta = ? AND status != 'Cancelada'");
-                $stmtCheck->execute([$medId, $dtCons, $hrCons]);
-                if ($stmtCheck->fetchColumn() > 0) {
-                    $botReply .= "\n\n⚠️ *Aviso do Sistema:* Este horário já acabou de ser ocupado para este médico. Por favor, escolha outro horário.";
+                $dataValida = DateTime::createFromFormat('Y-m-d', $dtCons);
+                $horaValida = DateTime::createFromFormat('H:i:s', $hrCons);
+
+                $stmtMedExists = $pdo->prepare("SELECT COUNT(*) FROM medicos WHERE id = ?");
+                $stmtMedExists->execute([$medId]);
+                $medicoExiste = (int) $stmtMedExists->fetchColumn() > 0;
+
+                if (!$medicoExiste || !$dataValida || $dataValida->format('Y-m-d') !== $dtCons || !$horaValida || $horaValida->format('H:i:s') !== $hrCons) {
+                    $botReply .= "\n\n⚠️ *Aviso do Sistema:* Os dados de data, horário ou médico informados são inválidos. Por favor, verifique e tente novamente.";
+                } elseif ($dtCons < date('Y-m-d')) {
+                    $botReply .= "\n\n⚠️ *Aviso do Sistema:* Não é possível agendar consultas para datas anteriores ao dia de hoje.";
                 } else {
-                    $stmtIns = $pdo->prepare("INSERT INTO consultas_medicas (paciente_nome, paciente_telefone, medico_id, data_consulta, hora_consulta, observacoes) VALUES (?, ?, ?, ?, ?, ?)");
-                    $stmtIns->execute([$pacNome, $pacTel, $medId, $dtCons, $hrCons, $obs]);
-                    $consultaAgendada = [
-                        'id'       => $pdo->lastInsertId(),
-                        'paciente' => $pacNome,
-                        'data'     => date('d/m/Y', strtotime($dtCons)),
-                        'hora'     => substr($hrCons, 0, 5)
-                    ];
+                    $stmtCheck = $pdo->prepare("SELECT COUNT(*) FROM consultas_medicas WHERE medico_id = ? AND data_consulta = ? AND hora_consulta = ? AND status != 'Cancelada'");
+                    $stmtCheck->execute([$medId, $dtCons, $hrCons]);
+                    if ($stmtCheck->fetchColumn() > 0) {
+                        $botReply .= "\n\n⚠️ *Aviso do Sistema:* Este horário já acabou de ser ocupado para este médico. Por favor, escolha outro horário.";
+                    } else {
+                        $stmtIns = $pdo->prepare("INSERT INTO consultas_medicas (paciente_nome, paciente_telefone, medico_id, data_consulta, hora_consulta, observacoes) VALUES (?, ?, ?, ?, ?, ?)");
+                        $stmtIns->execute([$pacNome, $pacTel, $medId, $dtCons, $hrCons, $obs]);
+                        $consultaAgendada = [
+                            'id'       => $pdo->lastInsertId(),
+                            'paciente' => $pacNome,
+                            'data'     => date('d/m/Y', strtotime($dtCons)),
+                            'hora'     => substr($hrCons, 0, 5)
+                        ];
+                    }
                 }
             }
         }
@@ -271,6 +292,7 @@ PROMPT;
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 
     <style>
         :root {
@@ -479,10 +501,10 @@ PROMPT;
                     </div>
                 <?php else: ?>
                     <?php foreach ($consultasLista as $c): ?>
-                        <div class="appt-card" id="appt-<?php echo $c['id']; ?>">
+                        <div class="appt-card" id="appt-<?php echo (int) $c['id']; ?>">
                             <div class="d-flex justify-content-between align-items-start">
                                 <strong class="text-white"><?php echo htmlspecialchars($c['paciente_nome']); ?></strong>
-                                <button class="btn btn-link text-danger p-0 lh-1" title="Cancelar" onclick="cancelarConsulta(<?php echo $c['id']; ?>)">
+                                <button class="btn btn-link text-danger p-0 lh-1" title="Cancelar" onclick="cancelarConsulta(<?php echo (int) $c['id']; ?>)">
                                     <i class="bi bi-x-circle"></i>
                                 </button>
                             </div>
@@ -558,12 +580,21 @@ PROMPT;
         }
         scrollToBottom();
 
+        function renderMarkdownSeguro(text) {
+            return DOMPurify.sanitize(marked.parse(text));
+        }
+
         function appendMessage(role, text) {
             const row = document.createElement('div');
             row.className = `message-row ${role}`;
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
-            bubble.innerHTML = role === 'bot' ? marked.parse(text) : text.replace(/\n/g, '<br>');
+            if (role === 'bot') {
+                bubble.innerHTML = renderMarkdownSeguro(text);
+            } else {
+                bubble.textContent = text;
+                bubble.innerHTML = bubble.innerHTML.replace(/\n/g, '<br>');
+            }
             row.appendChild(bubble);
             chatMessages.appendChild(row);
             scrollToBottom();
@@ -574,31 +605,56 @@ PROMPT;
             const container = document.getElementById('listaConsultasSidebar');
             const badge = document.getElementById('badgeTotalConsultas');
             badge.textContent = consultas.length;
+            container.innerHTML = '';
 
             if (consultas.length === 0) {
-                container.innerHTML = '<div class="text-center text-secondary small py-3 border border-secondary border-opacity-25 rounded">Nenhuma consulta marcada.</div>';
+                const vazio = document.createElement('div');
+                vazio.className = 'text-center text-secondary small py-3 border border-secondary border-opacity-25 rounded';
+                vazio.textContent = 'Nenhuma consulta marcada.';
+                container.appendChild(vazio);
                 return;
             }
 
-            container.innerHTML = consultas.map(c => {
+            consultas.forEach(c => {
                 const partesData = c.data_consulta.split('-');
                 const dataFormatada = `${partesData[2]}/${partesData[1]}/${partesData[0]}`;
                 const horaFormatada = c.hora_consulta.substring(0, 5);
-                return `
-                    <div class="appt-card" id="appt-${c.id}">
-                        <div class="d-flex justify-content-between align-items-start">
-                            <strong class="text-white">${c.paciente_nome}</strong>
-                            <button class="btn btn-link text-danger p-0 lh-1" title="Cancelar" onclick="cancelarConsulta(${c.id})">
-                                <i class="bi bi-x-circle"></i>
-                            </button>
-                        </div>
-                        <div class="text-info small">${c.especialidade} - ${c.medico_nome}</div>
-                        <div class="text-secondary mt-1" style="font-size: 0.78rem;">
-                            <i class="bi bi-calendar-event me-1"></i>${dataFormatada} às <strong>${horaFormatada}</strong>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+                const idSeguro = parseInt(c.id, 10);
+
+                const card = document.createElement('div');
+                card.className = 'appt-card';
+                card.id = `appt-${idSeguro}`;
+
+                const header = document.createElement('div');
+                header.className = 'd-flex justify-content-between align-items-start';
+
+                const nomeEl = document.createElement('strong');
+                nomeEl.className = 'text-white';
+                nomeEl.textContent = c.paciente_nome;
+
+                const btnCancel = document.createElement('button');
+                btnCancel.className = 'btn btn-link text-danger p-0 lh-1';
+                btnCancel.title = 'Cancelar';
+                btnCancel.innerHTML = '<i class="bi bi-x-circle"></i>';
+                btnCancel.onclick = () => cancelarConsulta(idSeguro);
+
+                header.appendChild(nomeEl);
+                header.appendChild(btnCancel);
+
+                const medEl = document.createElement('div');
+                medEl.className = 'text-info small';
+                medEl.textContent = `${c.especialidade} - ${c.medico_nome}`;
+
+                const dataEl = document.createElement('div');
+                dataEl.className = 'text-secondary mt-1';
+                dataEl.style.fontSize = '0.78rem';
+                dataEl.innerHTML = `<i class="bi bi-calendar-event me-1"></i>${DOMPurify.sanitize(dataFormatada)} às <strong>${DOMPurify.sanitize(horaFormatada)}</strong>`;
+
+                card.appendChild(header);
+                card.appendChild(medEl);
+                card.appendChild(dataEl);
+                container.appendChild(card);
+            });
         }
 
         chatForm.addEventListener('submit', async (e) => {
@@ -622,15 +678,17 @@ PROMPT;
                 const data = await res.json();
 
                 if (data.success) {
-                    typingBubble.innerHTML = marked.parse(data.reply);
+                    typingBubble.innerHTML = renderMarkdownSeguro(data.reply);
                     if (data.consultas) {
                         atualizarSidebar(data.consultas);
                     }
                 } else {
-                    typingBubble.innerHTML = `<span class="text-danger">Erro: ${data.error || 'Falha na resposta.'}</span>`;
+                    typingBubble.textContent = `Erro: ${data.error || 'Falha na resposta.'}`;
+                    typingBubble.classList.add('text-danger');
                 }
             } catch (err) {
-                typingBubble.innerHTML = '<span class="text-danger">Erro de conexão com o servidor.</span>';
+                typingBubble.textContent = 'Erro de conexão com o servidor.';
+                typingBubble.classList.add('text-danger');
             } finally {
                 userInput.disabled = false;
                 btnSend.disabled = false;
@@ -640,15 +698,19 @@ PROMPT;
         });
 
         async function cancelarConsulta(id) {
-            if (!confirm('Deseja realmente cancelar esta consulta?')) return;
+            const pin = prompt('Digite o PIN administrativo para cancelar esta consulta:');
+            if (pin === null) return;
+
             const res = await fetch('index.php?action=cancel_appointment', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id })
+                body: JSON.stringify({ id, pin })
             });
             const data = await res.json();
             if (data.success) {
                 location.reload();
+            } else {
+                alert(data.error || 'Não foi possível cancelar.');
             }
         }
 
